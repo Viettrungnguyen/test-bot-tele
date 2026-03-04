@@ -1,2 +1,2 @@
-# Ignore file .env để không vô tình commit API key lên git
+# Ignore file .env
 .env

@@ -1,14 +1,12 @@
 """
 ================================================================
   Telegram AI Chatbot - Dual Provider: Gemini + Groq
-  Thư viện: pyTelegramBotAPI, google-generativeai, groq, python-dotenv
+  Libraries: pyTelegramBotAPI, google-generativeai, groq, python-dotenv
 ================================================================
-  Chiến lược gọi AI:
-    1. Thử Gemini (nếu có GEMINI_API_KEY)
-    2. Nếu Gemini lỗi/quota hết → tự động chuyển sang Groq
-    3. Nếu cả hai đều lỗi → báo lỗi cho người dùng
-
-  Bạn có thể chỉ cần 1 trong 2 key, hoặc cả 2 đều được.
+  AI Call Strategy:
+    1. Try Gemini first (if GEMINI_API_KEY is set)
+    2. If Gemini fails/quota exceeded → auto fallback to Groq
+    3. If both fail → notify user with error message
 ================================================================
 """
 
@@ -21,241 +19,235 @@ from groq import Groq
 from dotenv import load_dotenv
 
 # ================================================================
-#  BƯỚC 1: NẠP BIẾN MÔI TRƯỜNG
+#  STEP 1: LOAD ENVIRONMENT VARIABLES
 # ================================================================
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")   # Có thể để trống
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY")     # Có thể để trống
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Optional
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Optional
 
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ Thiếu TELEGRAM_BOT_TOKEN trong file .env!")
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN in .env file!")
 if not GEMINI_API_KEY and not GROQ_API_KEY:
-    raise ValueError("❌ Cần ít nhất 1 trong 2: GEMINI_API_KEY hoặc GROQ_API_KEY!")
+    raise ValueError("At least one of GEMINI_API_KEY or GROQ_API_KEY is required!")
 
 
 # ================================================================
-#  BƯỚC 2: KHỞI TẠO CÁC CLIENT
+#  STEP 2: INITIALIZE BOT AND AI CLIENTS
 # ================================================================
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# --- Khởi tạo Gemini (nếu có key) ---
+# --- Gemini setup (if key is provided) ---
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    # Danh sách Gemini model thử theo thứ tự ưu tiên
+    # Models to try in order of priority
     GEMINI_MODELS = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.0-pro"]
 else:
-    GEMINI_MODELS = []  # Bỏ qua Gemini nếu không có key
-    print("[INFO] Không có GEMINI_API_KEY → chỉ dùng Groq")
+    GEMINI_MODELS = []
+    print("[INFO] No GEMINI_API_KEY found → using Groq only")
 
-# --- Khởi tạo Groq (nếu có key) ---
+# --- Groq setup (if key is provided) ---
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 if not groq_client:
-    print("[INFO] Không có GROQ_API_KEY → chỉ dùng Gemini")
+    print("[INFO] No GROQ_API_KEY found → using Gemini only")
 
-# Groq model dùng mặc định (miễn phí, rất nhanh)
+# Groq default model (free and fast)
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# System prompt chung cho cả 2 provider
+# System prompt shared by both providers
 SYSTEM_PROMPT = (
-    "Bạn là một trợ lý AI thân thiện, thông minh và hữu ích. "
-    "Hãy trả lời bằng tiếng Việt, ngắn gọn và dễ hiểu. "
-    "Nếu không biết câu trả lời, hãy thành thật nói không biết."
+    "You are a friendly, smart, and helpful AI assistant. "
+    "Answer clearly and concisely. "
+    "If you don't know the answer, be honest and say so."
 )
 
 
 # ================================================================
-#  BƯỚC 3A: HÀM GỌI GEMINI (với retry tự động)
+#  STEP 3A: CALL GEMINI (with auto-retry on rate limit)
 # ================================================================
-def goi_gemini(cau_hoi: str) -> str:
-    """Thử gọi lần lượt các Gemini model, retry nếu bị rate limit tạm thời."""
+def call_gemini(question: str) -> str:
+    """Try Gemini models in order, retry if temporarily rate-limited."""
     if not GEMINI_MODELS:
-        raise RuntimeError("Không có GEMINI_API_KEY")
+        raise RuntimeError("No GEMINI_API_KEY configured")
 
-    prompt = f"{SYSTEM_PROMPT}\n\nNgười dùng hỏi: {cau_hoi}"
+    prompt = f"{SYSTEM_PROMPT}\n\nUser: {question}"
 
-    for ten_model in GEMINI_MODELS:
-        model = genai.GenerativeModel(ten_model)
-        so_lan_thu = 0
+    for model_name in GEMINI_MODELS:
+        model = genai.GenerativeModel(model_name)
+        attempts = 0
 
-        while so_lan_thu <= 1:  # thử tối đa 2 lần mỗi model
+        while attempts <= 1:  # max 2 attempts per model
             try:
-                print(f"[Gemini] Đang dùng: {ten_model}")
+                print(f"[Gemini] Trying model: {model_name}")
                 response = model.generate_content(prompt)
-                return f"[Gemini/{ten_model}]\n\n{response.text}"
+                return f"[Gemini/{model_name}]\n\n{response.text}"
 
-            except Exception as loi:
-                loi_str = str(loi)
-                # Rate limit tạm thời → chờ rồi retry
-                if "429" in loi_str and "retry" in loi_str.lower():
-                    cho = 15
-                    ket_qua = re.search(r"seconds:\s*(\d+)", loi_str)
-                    if ket_qua:
-                        cho = int(ket_qua.group(1)) + 2
-                    so_lan_thu += 1
-                    if so_lan_thu <= 1:
-                        print(f"[Gemini] Rate limit, chờ {cho}s...")
-                        time.sleep(cho)
+            except Exception as err:
+                err_str = str(err)
+                # Temporary rate limit → wait and retry same model
+                if "429" in err_str and "retry" in err_str.lower():
+                    wait = 15
+                    match = re.search(r"seconds:\s*(\d+)", err_str)
+                    if match:
+                        wait = int(match.group(1)) + 2
+                    attempts += 1
+                    if attempts <= 1:
+                        print(f"[Gemini] Rate limited. Waiting {wait}s...")
+                        time.sleep(wait)
                         continue
-                # Quota hết hẳn hoặc lỗi khác → chuyển model
-                print(f"[Gemini] {ten_model} thất bại: {loi_str[:80]}")
+                # Quota exhausted or other error → try next model
+                print(f"[Gemini] {model_name} failed: {err_str[:80]}")
                 break
 
-    raise RuntimeError("Tất cả Gemini model đều không khả dụng")
+    raise RuntimeError("All Gemini models are unavailable")
 
 
 # ================================================================
-#  BƯỚC 3B: HÀM GỌI GROQ
+#  STEP 3B: CALL GROQ
 # ================================================================
-def goi_groq(cau_hoi: str) -> str:
-    """Gọi Groq API với model LLaMA. Nhanh và miễn phí."""
+def call_groq(question: str) -> str:
+    """Call Groq API using LLaMA model. Fast and free."""
     if not groq_client:
-        raise RuntimeError("Không có GROQ_API_KEY")
+        raise RuntimeError("No GROQ_API_KEY configured")
 
-    print(f"[Groq] Đang dùng: {GROQ_MODEL}")
+    print(f"[Groq] Using model: {GROQ_MODEL}")
 
-    # Groq dùng định dạng messages (giống OpenAI)
-    # "system": định nghĩa tính cách AI
-    # "user": câu hỏi của người dùng
+    # Groq uses OpenAI-compatible message format
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": cau_hoi},
+            {"role": "user", "content": question},
         ],
-        temperature=0.7,    # 0=chắc chắn, 1=sáng tạo
-        max_tokens=1024,    # giới hạn độ dài câu trả lời
+        temperature=0.7,  # 0 = deterministic, 1 = creative
+        max_tokens=1024,  # max response length
     )
 
-    # Lấy text từ response (khác với Gemini)
     return f"[Groq/{GROQ_MODEL}]\n\n{response.choices[0].message.content}"
 
 
 # ================================================================
-#  BƯỚC 3C: HÀM TỔNG — Thử Gemini trước, fallback sang Groq
+#  STEP 3C: ORCHESTRATOR — Try Gemini first, fallback to Groq
 # ================================================================
-def goi_ai(cau_hoi: str) -> str:
+def call_ai(question: str) -> str:
     """
-    Điều phối: thử Gemini → nếu thất bại thì thử Groq.
-    Raise RuntimeError nếu cả hai đều không khả dụng.
+    Routes the question: tries Gemini first, falls back to Groq.
+    Raises RuntimeError if both providers fail.
     """
-    # Thử Gemini trước (nếu có key)
     if GEMINI_MODELS:
         try:
-            return goi_gemini(cau_hoi)
+            return call_gemini(question)
         except RuntimeError:
-            print("[INFO] Gemini thất bại → chuyển sang Groq...")
+            print("[INFO] Gemini unavailable → switching to Groq...")
 
-    # Fallback: thử Groq
     if groq_client:
-        return goi_groq(cau_hoi)
+        return call_groq(question)
 
-    raise RuntimeError("Không có AI provider nào khả dụng!")
+    raise RuntimeError("No AI provider is available!")
 
 
 # ================================================================
-#  LỆNH /start
+#  /start COMMAND
 # ================================================================
 @bot.message_handler(commands=["start"])
 def handle_start(message):
-    ten = message.from_user.first_name
+    name = message.from_user.first_name
 
-    # Hiển thị provider đang hoạt động
     providers = []
-    if GEMINI_MODELS: providers.append("Gemini ✨")
-    if groq_client:   providers.append("Groq ⚡")
-    ds_provider = " + ".join(providers)
+    if GEMINI_MODELS:
+        providers.append("Gemini ✨")
+    if groq_client:
+        providers.append("Groq ⚡")
+    provider_list = " + ".join(providers)
 
-    chao = (
-        f"👋 Xin chào, *{ten}*!\n\n"
-        f"🤖 Tôi là Trợ lý AI sử dụng: *{ds_provider}*\n"
-        "Hãy nhắn tin bất kỳ điều gì, tôi sẽ cố gắng giúp bạn!\n\n"
-        "Gõ /help để xem hướng dẫn."
+    welcome = (
+        f"👋 Hello, *{name}*!\n\n"
+        f"🤖 I'm your AI assistant powered by: *{provider_list}*\n"
+        "Ask me anything and I'll do my best to help!\n\n"
+        "Type /help to see available commands."
     )
-    bot.reply_to(message, chao, parse_mode="Markdown")
+    bot.reply_to(message, welcome, parse_mode="Markdown")
 
 
 # ================================================================
-#  LỆNH /help
+#  /help COMMAND
 # ================================================================
 @bot.message_handler(commands=["help"])
 def handle_help(message):
-    huong_dan = (
-        "📋 *Hướng dẫn sử dụng:*\n\n"
-        "▶ /start  — Khởi động và nhận lời chào\n"
-        "▶ /help   — Xem hướng dẫn này\n"
-        "▶ /status — Kiểm tra trạng thái AI provider\n\n"
-        "💬 *Cách dùng:*\n"
-        "Chỉ cần gõ bất kỳ câu hỏi nào!\n"
-        "Ví dụ: _\"Giải thích machine learning là gì?\"_\n\n"
+    guide = (
+        "📋 *Available Commands:*\n\n"
+        "▶ /start  — Start the bot and get a greeting\n"
+        "▶ /help   — Show this help message\n"
+        "▶ /status — Check AI provider status\n\n"
+        "💬 *How to use:*\n"
+        "Just type any question!\n"
+        'Example: _"What is machine learning?"_\n\n'
         "⚡ Powered by Gemini + Groq AI"
     )
-    bot.reply_to(message, huong_dan, parse_mode="Markdown")
+    bot.reply_to(message, guide, parse_mode="Markdown")
 
 
 # ================================================================
-#  LỆNH /status — Kiểm tra AI provider đang hoạt động
+#  /status COMMAND — Check which AI providers are active
 # ================================================================
 @bot.message_handler(commands=["status"])
 def handle_status(message):
-    gemini_status = "✅ Sẵn sàng" if GEMINI_MODELS else "❌ Không có key"
-    groq_status   = "✅ Sẵn sàng" if groq_client   else "❌ Không có key"
+    gemini_status = "✅ Ready" if GEMINI_MODELS else "❌ No API key"
+    groq_status = "✅ Ready" if groq_client else "❌ No API key"
 
-    trang_thai = (
-        "🔍 *Trạng thái AI Provider:*\n\n"
+    status = (
+        "🔍 *AI Provider Status:*\n\n"
         f"◈ *Gemini* (Google): {gemini_status}\n"
         f"◈ *Groq* (LLaMA):    {groq_status}\n\n"
-        "_Gemini được thử trước, Groq là backup._"
+        "_Gemini is tried first. Groq serves as backup._"
     )
-    bot.reply_to(message, trang_thai, parse_mode="Markdown")
+    bot.reply_to(message, status, parse_mode="Markdown")
 
 
 # ================================================================
-#  XỬ LÝ TIN NHẮN THƯỜNG — Gọi AI
+#  HANDLE REGULAR TEXT MESSAGES — Call AI
 # ================================================================
-@bot.message_handler(
-    content_types=["text"],
-    func=lambda m: not m.text.startswith("/")
-)
+@bot.message_handler(content_types=["text"], func=lambda m: not m.text.startswith("/"))
 def handle_ai_message(message):
-    cau_hoi = message.text
+    question = message.text
 
-    # Gửi "Đang xử lý..." ngay để người dùng không chờ trống
-    tin_cho = bot.reply_to(message, "⏳ Đang xử lý, vui lòng chờ...")
+    # Send "processing" message immediately so user knows bot is working
+    processing_msg = bot.reply_to(message, "⏳ Processing, please wait...")
 
     try:
-        # Gọi AI (Gemini ưu tiên, Groq fallback)
-        cau_tra_loi = goi_ai(cau_hoi)
+        # Call AI (Gemini first, Groq as fallback)
+        answer = call_ai(question)
 
-        # Xóa tin "Đang xử lý..." và gửi câu trả lời thật
-        bot.delete_message(message.chat.id, tin_cho.message_id)
-        bot.reply_to(message, cau_tra_loi)
+        # Delete "processing" message and send the real answer
+        bot.delete_message(message.chat.id, processing_msg.message_id)
+        bot.reply_to(message, answer)
 
-    except Exception as loi:
-        print(f"[LỖI CUỐI] {loi}")
+    except Exception as err:
+        print(f"[FATAL ERROR] {err}")
+        # Edit "processing" message to show error
         bot.edit_message_text(
             chat_id=message.chat.id,
-            message_id=tin_cho.message_id,
+            message_id=processing_msg.message_id,
             text=(
-                "⚠️ *Không thể kết nối AI lúc này.*\n\n"
-                "Nguyên nhân có thể:\n"
-                "• Đã hết quota của tất cả provider\n"
-                "• Lỗi mạng hoặc API quá tải\n\n"
-                "💡 _Dùng /status để kiểm tra trạng thái._\n"
-                "Vui lòng thử lại sau!"
+                "⚠️ *Unable to reach AI at the moment.*\n\n"
+                "Possible reasons:\n"
+                "• All provider quotas are exhausted\n"
+                "• Network or API is temporarily down\n\n"
+                "💡 _Use /status to check provider availability._\n"
+                "Please try again later!"
             ),
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
 
 # ================================================================
-#  VÒNG LẶP CHÍNH
+#  MAIN LOOP
 # ================================================================
 if __name__ == "__main__":
-    print("🚀 Telegram AI Bot (Gemini + Groq) đang khởi động...")
-    print(f"   Gemini: {'✅ ' + str(GEMINI_MODELS) if GEMINI_MODELS else '❌ Không có key'}")
-    print(f"   Groq:   {'✅ ' + GROQ_MODEL if groq_client else '❌ Không có key'}")
-    print("📩 Bot sẵn sàng! Nhấn Ctrl+C để dừng.\n")
+    print("🚀 Telegram AI Bot (Gemini + Groq) starting...")
+    print(f"   Gemini: {'✅ ' + str(GEMINI_MODELS) if GEMINI_MODELS else '❌ No key'}")
+    print(f"   Groq:   {'✅ ' + GROQ_MODEL if groq_client else '❌ No key'}")
+    print("📩 Bot is ready! Press Ctrl+C to stop.\n")
 
     bot.infinity_polling(none_stop=True, interval=0)
